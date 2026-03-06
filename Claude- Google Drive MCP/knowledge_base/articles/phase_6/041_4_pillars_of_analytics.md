@@ -9,10 +9,11 @@ date_captured: "2026-03-06"
 ---
 
 ## Summary
-
+The article presents a structured framework organizing analytics work into four foundational pillars, providing data teams with a mental model for categorizing and prioritizing their analytical activities. For data leaders, such frameworks are critical for aligning team capabilities with business needs, communicating value clearly, and building scalable data product strategies. Understanding these pillars helps leaders avoid ad hoc analytics culture and instead build intentional, repeatable systems.
 
 ## Key Excerpts
-
+> Effective analytics is not monolithic — it can be broken into distinct pillars that each serve a different organizational purpose and require different skills.
+> Data teams that lack a shared framework for analytics risk misaligned priorities, redundant work, and difficulty demonstrating strategic value to stakeholders.
+> Treating analytics as a product discipline means applying structure, ownership, and iteration principles to how insights are built and delivered.
 
 ## Annotations
-

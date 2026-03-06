@@ -3,7 +3,7 @@
 Knowledge Base MCP Server.
 
 Exposes three tools to Claude:
-  - semantic_search(query, limit)  — cosine similarity search over embeddings
+  - semantic_search(query, limit)  — full-text search using PostgreSQL tsvector
   - get_by_phase(phase)            — return all articles in a given phase
   - get_article(article_number)    — return one article by its number
 
@@ -12,6 +12,7 @@ Run:
 """
 
 import os
+import sys
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
@@ -22,38 +23,13 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 import psycopg2
 import psycopg2.extras
-from pgvector.psycopg2 import register_vector
-from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
-# Globals — initialized once at startup
+# Global DB connection — lazy singleton
 # ---------------------------------------------------------------------------
 
-_model = None      # type: Optional[SentenceTransformer]
-_conn = None       # type: Optional[psycopg2.extensions.connection]
-
-mcp = FastMCP(
-    name="knowledge-base",
-    instructions=(
-        "A curated knowledge base of 90 articles on data infrastructure, "
-        "data governance, and AI/ML — covering 20 years of industry evolution. "
-        "Use semantic_search to find articles by concept or question, "
-        "get_by_phase to browse a specific learning phase (0-9), and "
-        "get_article to retrieve a full article record by number."
-    ),
-)
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def get_model():
-    # type: () -> SentenceTransformer
-    global _model
-    if _model is None:
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _model
+_conn = None  # type: Optional[psycopg2.extensions.connection]
 
 
 def get_connection():
@@ -68,20 +44,13 @@ def get_connection():
             password=os.environ.get("DB_PASSWORD", ""),
             cursor_factory=psycopg2.extras.RealDictCursor,
         )
-        register_vector(_conn)
     return _conn
-
-
-def embed_query(text):
-    # type: (str) -> List[float]
-    vector = get_model().encode(text, normalize_embeddings=True)
-    return vector.tolist()
 
 
 def clean_row(row):
     # type: (Any) -> Dict[str, Any]
     result = dict(row)
-    result.pop("embedding", None)
+    result.pop("search_vector", None)
     if result.get("date_captured") is not None:
         result["date_captured"] = str(result["date_captured"])
     if result.get("created_at") is not None:
@@ -89,6 +58,23 @@ def clean_row(row):
     if result.get("updated_at") is not None:
         result["updated_at"] = result["updated_at"].isoformat()
     return result
+
+
+# ---------------------------------------------------------------------------
+# MCP server
+# ---------------------------------------------------------------------------
+
+mcp = FastMCP(
+    name="knowledge-base",
+    instructions=(
+        "A curated knowledge base of 90 articles on data infrastructure, "
+        "data governance, and AI/ML — covering 20 years of industry evolution. "
+        "Use semantic_search to find articles by concept or question, "
+        "get_by_phase to browse a specific learning phase (0-9), and "
+        "get_article to retrieve a full article record by number."
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # MCP Tools
@@ -98,10 +84,10 @@ def clean_row(row):
 def semantic_search(query, limit=5):
     # type: (str, int) -> List[Dict[str, Any]]
     """
-    Search the knowledge base using semantic similarity.
+    Search the knowledge base using full-text search.
 
-    Embeds the query and returns the most relevant articles ranked by
-    cosine similarity against stored embeddings.
+    Embeds the query against article titles, themes, summaries, and annotations
+    using PostgreSQL tsvector and returns ranked results.
 
     Args:
         query: A natural language question or concept (e.g. "what is data mesh?")
@@ -113,8 +99,6 @@ def semantic_search(query, limit=5):
         annotations, date_captured, and similarity_score.
     """
     limit = min(max(1, limit), 20)
-    query_vector = embed_query(query)
-
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -123,13 +107,13 @@ def semantic_search(query, limit=5):
             id, article_number, title, source_url, phase, phase_name,
             themes, summary, key_excerpts, annotations, date_captured,
             created_at, updated_at,
-            1 - (embedding <=> %(v)s::vector) AS similarity_score
-        FROM articles
-        WHERE embedding IS NOT NULL
-        ORDER BY embedding <=> %(v)s::vector
+            ts_rank(search_vector, query) AS similarity_score
+        FROM articles, plainto_tsquery('english', %(q)s) query
+        WHERE search_vector @@ query
+        ORDER BY ts_rank(search_vector, query) DESC
         LIMIT %(l)s;
         """,
-        {"v": query_vector, "l": limit},
+        {"q": query, "l": limit},
     )
     rows = cur.fetchall()
     cur.close()
@@ -206,13 +190,11 @@ def get_article(article_number):
     cur.close()
     return clean_row(row) if row else None
 
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("Initializing knowledge base MCP server...")
-    get_model()
-    get_connection()
-    print("Ready. Starting MCP server.")
+    sys.stderr.write("Starting knowledge base MCP server...\n")
     mcp.run()

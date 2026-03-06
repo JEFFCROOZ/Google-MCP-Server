@@ -3,7 +3,8 @@
 Ingest script for the knowledge base.
 
 Reads all .md files from knowledge_base/articles/, parses YAML frontmatter,
-generates sentence-transformer embeddings, and upserts into PostgreSQL.
+and upserts into PostgreSQL. Full-text search is handled by a generated
+tsvector column — no embeddings or external ML libraries required.
 
 Usage:
     python knowledge_base/ingest.py
@@ -18,7 +19,7 @@ import glob
 import yaml
 import psycopg2
 import psycopg2.extras
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 from datetime import date
 from pathlib import Path
 from dotenv import load_dotenv
@@ -39,27 +40,6 @@ def get_connection():
         user=os.environ.get("DB_USER", "postgres"),
         password=os.environ.get("DB_PASSWORD", ""),
     )
-
-# ---------------------------------------------------------------------------
-# Embedding model (lazy singleton)
-# ---------------------------------------------------------------------------
-
-_model = None
-
-def get_model():
-    global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        print("Loading sentence-transformer model (all-MiniLM-L6-v2)...")
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-        print("Model loaded.")
-    return _model
-
-def generate_embedding(text):
-    # type: (str) -> List[float]
-    model = get_model()
-    embedding = model.encode(text, normalize_embeddings=True)
-    return embedding.tolist()
 
 # ---------------------------------------------------------------------------
 # Markdown parsing
@@ -143,38 +123,17 @@ def _extract_excerpts(body):
     return excerpts if excerpts else None
 
 # ---------------------------------------------------------------------------
-# Embedding text construction
-# ---------------------------------------------------------------------------
-
-def build_embedding_text(record):
-    # type: (Dict[str, Any]) -> str
-    parts = []
-    title = (record.get("title") or "").strip()
-    if title:
-        parts.append(title)
-    phase_name = (record.get("phase_name") or "").strip()
-    if phase_name:
-        parts.append(phase_name)
-    themes = record.get("themes") or []
-    if themes:
-        parts.append(", ".join(str(t) for t in themes))
-    summary = record.get("summary") or ""
-    if summary.strip():
-        parts.append(summary.strip()[:2000])
-    return ". ".join(parts)
-
-# ---------------------------------------------------------------------------
 # Database upsert
 # ---------------------------------------------------------------------------
 
 UPSERT_SQL = """
 INSERT INTO articles (
     article_number, title, source_url, phase, phase_name,
-    themes, summary, key_excerpts, annotations, date_captured, embedding
+    themes, summary, key_excerpts, annotations, date_captured
 )
 VALUES (
     %(article_number)s, %(title)s, %(source_url)s, %(phase)s, %(phase_name)s,
-    %(themes)s, %(summary)s, %(key_excerpts)s, %(annotations)s, %(date_captured)s, %(embedding)s
+    %(themes)s, %(summary)s, %(key_excerpts)s, %(annotations)s, %(date_captured)s
 )
 ON CONFLICT (article_number) DO UPDATE SET
     title          = EXCLUDED.title,
@@ -186,14 +145,13 @@ ON CONFLICT (article_number) DO UPDATE SET
     key_excerpts   = EXCLUDED.key_excerpts,
     annotations    = EXCLUDED.annotations,
     date_captured  = EXCLUDED.date_captured,
-    embedding      = EXCLUDED.embedding,
     updated_at     = NOW()
 RETURNING id, (xmax = 0) AS inserted;
 """
 
 
-def upsert_article(cursor, record, embedding):
-    from pgvector.psycopg2 import register_vector
+def upsert_article(cursor, record):
+    # type: (Any, Dict[str, Any]) -> tuple
     date_captured = record.get("date_captured")
     if isinstance(date_captured, str):
         try:
@@ -212,7 +170,6 @@ def upsert_article(cursor, record, embedding):
         "key_excerpts": record.get("key_excerpts") or None,
         "annotations": record.get("annotations") or None,
         "date_captured": date_captured,
-        "embedding": embedding,
     }
     cursor.execute(UPSERT_SQL, params)
     row = cursor.fetchone()
@@ -249,8 +206,6 @@ def run_ingest(dry_run=False, phase_filter=None):
     cursor = None
     if not dry_run:
         conn = get_connection()
-        from pgvector.psycopg2 import register_vector
-        register_vector(conn)
         cursor = conn.cursor()
 
     inserted = updated = skipped = errors = 0
@@ -277,16 +232,15 @@ def run_ingest(dry_run=False, phase_filter=None):
             skipped += 1
             continue
 
-        embed_text = build_embedding_text(record)
         print("  #{} — {}".format(record["article_number"], record["title"][:60]))
 
         if dry_run:
-            print("  [DRY RUN] embed text: {}...".format(embed_text[:80]))
+            summary_preview = (record.get("summary") or "")[:60]
+            print("  [DRY RUN] summary: {}...".format(summary_preview))
             continue
 
         try:
-            embedding = generate_embedding(embed_text)
-            db_id, was_inserted = upsert_article(cursor, record, embedding)
+            db_id, was_inserted = upsert_article(cursor, record)
             conn.commit()
             if was_inserted:
                 print("  INSERTED (id={})".format(db_id))
